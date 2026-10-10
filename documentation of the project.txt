@@ -1,0 +1,81 @@
+issues with the current version
+1) only one command at a time, lets say a user wants the user to go left,right, then say something the brain wont be able to process it , can be updated in future versions
+
+
+
+// current events of every service and short description of what it means
+-----------------------------------------------------------------------------
+speech-service
+-----------------------------------------------------------------------------
+wake_word_detected-> // speech service is responsible for detecting wake word and sending this event
+person_identified ->                // speech service fires this event when it succesfully transcribes the persons name when the brain command sends "identify" command with a text
+transcription_ready -> // speech service sends this event a minute after wakeword detected command. for a minute(or configured time) the speech service keeps mic open and transcribe every speech to text and fires this command along with transcribed text
+----------------------------------------------------------------------------
+navigation-service
+----------------------------------------------------------------------------
+obstacle_detected -> this is the only event the navigation service fires when there object closer than configured threshold
+
+----------------------------------------------------------------------------
+vision-service
+----------------------------------------------------------------------------
+unknown_person_detected -> fires this even when it scans after brain commands and finds the person is not saved in db.
+person_detected-> when it scans and finds a matching profile in db , returns the name of the person in text
+object_detected-> when thers no face but an object calls an open image processing llm to detect the object and returns it as text
+saved_face -> fires this event after successfully saves the image matrix of the event in db with the name provided by the brain command'saveface'
+'no_face_detected -> when no face or object is detected 
+
+-----------------------------------------------------------------------------
+brain-service
+-----------------------------------------------------------------------------
+a brain command looks likes this public class BrainCommand {
+    String target;
+    String command;
+    String text;
+}
+**navigation**
+Stop -> stop the motors temperorily
+start -> resume the motors 
+left -> make a left turn
+right -> make a right turn 
+
+**speech**
+speak ->  say the text in the command 
+identify -> say the text In the command and turn on mic to process speech
+
+**vision**
+scan -> called whenever the navigation services detects something and sends object detected event , dtects wheather the object is person or an obstacle, uses saved profiles to retrieved people name and if not present returns unknown_person_detected event and if obstacle then sends object_detected with the object name
+saveFace -> called after unknown_person_detected to save the profile of new face with name provided by speech service after identify command was given
+-----------------------------------------------------------------------------
+model classes
+-----------------------------------------------------------------------------
+ public enum IntentMode {WANDER,IDLE}
+public enum NavState {EXPLORING,PAUSED_SPEECH,BLOCKED,IDLE}
+public enum SpeechState {LISTENING,THINKING,SPEAKING,IDLE,ERROR}
+public enum VisionState {SCANNING,SAVING,IDLE}
+-----------------------------------------------------------------------------
+my expectation from the project and basic design
+-----------------------------------------------------------------------------
+I am working on software which basically gives a physical robot a brain it follows a microservice architecture with 4 services brain,vision,speech and navigation,who only communicate through kafka. each service acts as dumb and only has sole purpose. 
+so I want my robot to wake up whenever I say the wake word which will be configured In speech service, I may give it any command but it will be one command . lets say I say it to wander it should check its current state and intent and act accordingly. everytime it detects any obstacle it has to stop which will be handled by navigation service, but it should do the same till it is speaking or listening for the command from the user.
+ 
+------------------------------------------------------------------------------------------------------------------------------------------
+working of individual microservices
+------------------------------------------------------------------------------------------------------------------------------------------
+speech-service
+------------------------------------------------------------------------------------------------------------------------------------------
+this service is microservice whos sole purpose listening and speeking it doesnt have brain of ittself and only works on the commands received through brainservice, my brain servce will send command in this formatpublic class BrainCommand {
+    String target; // speech
+    String command; // identify , speek
+    String text; // any text that i have to say 
+} and this service will send the mesage through producer in this format public class TaskCompletion {
+    String task; // speak
+    String status; // success , failure
+    String timestamp;
+}
+and public class SpeechEvent {
+    String event; // person_identified ,wake_word_detected,transcription_ready
+    String text;  
+    String timestamp;
+}
+, when i receive speek command i need to speek the text and send taskcompletion to  brain_service, when i receive identify command i need to speak the text and after that listen for 15 seconds for user to say the name and pass the name back to brain-service with person_identified event and the name in text field
+apart from this i will keep my mic on all the time to hear the wake word as soon i hear it i need to fire wake_word_detected command to brain-service , and again keep my mic on for other 30 seconds to process whatever the user wants to say, i need to convert it text and fire transcription_ready event along with the transcribe text.

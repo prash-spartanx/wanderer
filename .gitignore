@@ -1,0 +1,133 @@
+# =====================================================================
+#  Wanderer / robo_software  (monorepo: brain + 3 Python services)
+#  Rename this file to ".gitignore" and put it in the repo root.
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# Secrets and local configuration
+# ---------------------------------------------------------------------
+.env
+.env.*
+**/.env
+**/.env.*
+*.env
+
+# ...but keep the templates so others know what to fill in
+!.env.example
+!env.example
+!**/.env.example
+!**/env.example
+
+# Spring Boot config (copy application.properties.example to create it)
+**/src/main/resources/application.properties
+**/src/main/resources/application-*.properties
+**/src/main/resources/application.yml
+**/src/main/resources/application-*.yml
+!**/src/main/resources/application*.example
+
+# Keys and certificates
+*.pem
+*.key
+*.p12
+*.jks
+*.crt
+
+# ---------------------------------------------------------------------
+# Python (speech_service, vision_service, navigation_service)
+# ---------------------------------------------------------------------
+# Virtual environments (covers .venv, .venv-1, venv, env, ...)
+.venv*/
+venv*/
+env/
+ENV/
+
+# Bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.cache/
+.coverage
+htmlcov/
+
+# Packaging
+*.egg-info/
+build/
+dist/
+pip-wheel-metadata/
+
+# ---------------------------------------------------------------------
+# Java / Spring Boot / Maven (brain)
+# ---------------------------------------------------------------------
+target/
+!.mvn/wrapper/maven-wrapper.jar
+HELP.md
+*.class
+*.jar
+*.war
+*.log
+hs_err_pid*
+
+# ---------------------------------------------------------------------
+# Robot data and models (personal data / large / re-downloadable)
+# ---------------------------------------------------------------------
+# Face embeddings are biometric data: never commit them
+known_faces.pkl
+*.pkl
+
+# Downloaded or large model files
+*.pt
+*.onnx
+*.tflite
+*.bin
+*.safetensors
+
+# Audio recordings and captured frames from tests
+*.wav
+*.mp3
+*.flac
+recordings/
+captures/
+tmp/
+temp/
+
+# ---------------------------------------------------------------------
+# Docker
+# ---------------------------------------------------------------------
+docker-compose.override.yml
+
+# ---------------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------------
+*.log
+logs/
+log/
+
+# ---------------------------------------------------------------------
+# IDEs and editors
+# ---------------------------------------------------------------------
+.idea/
+*.iml
+*.iws
+.vscode/
+.vs/
+.settings/
+.project
+.classpath
+.factorypath
+.sts4/
+.history/
+*.swp
+*~
+
+# ---------------------------------------------------------------------
+# Operating system junk
+# ---------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/

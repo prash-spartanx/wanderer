@@ -1,0 +1,202 @@
+name: robo
+
+# ---------------------------------------------------------------------------
+# Two ways to run this file:
+#
+#   docker compose up -d --build
+#       -> Kafka, topic setup, Postgres, Redis and the Brain.
+#          Use this on Windows. Run speech/vision/navigation natively with
+#          their existing .env files (KAFKA_BOOTSTRAP=localhost:9092).
+#
+#   docker compose --profile robot up -d --build
+#       -> Same as above, plus speech, vision and navigation as containers.
+#          Only works on a Linux host (Raspberry Pi, Ubuntu, ...) where the
+#          mic, camera and Arduino serial port can be passed into containers.
+#
+# Ollama is NOT in this file. Run `ollama serve` on the host as before.
+# ---------------------------------------------------------------------------
+
+services:
+
+  # ========================= INFRASTRUCTURE =========================
+
+  kafka:
+    image: apache/kafka:3.8.0
+    restart: unless-stopped
+    ports:
+      - "9092:9092"          # host access (native Python services, tools)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # Three listeners:
+      #   PLAINTEXT :29092 -> other containers  (kafka:29092)
+      #   EXTERNAL  :9092  -> your host machine (localhost:9092)
+      #   CONTROLLER:9093  -> internal KRaft traffic
+      KAFKA_LISTENERS: PLAINTEXT://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:29092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  # One-shot job: creates every topic before any service starts, so the
+  # consumers never subscribe to a topic that doesn't exist yet.
+  kafka-init:
+    image: apache/kafka:3.8.0
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash"]
+    command:
+      - -c
+      - |
+        for t in brain-commands speech-events vision-events nav-events task-completions; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
+            --create --if-not-exists --topic $$t --partitions 1 --replication-factor 1
+        done
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-robot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-robot}
+      POSTGRES_DB: ${POSTGRES_DB:-robot}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-robot} -d ${POSTGRES_DB:-robot}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Remove this service (and the SPRING_DATA_REDIS_* lines in `brain`)
+  # once the Brain no longer uses Redis.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ============================== BRAIN ==============================
+
+  brain:
+    build: ./brain
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      SERVER_PORT: 8080
+
+      # Spring maps SPRING_KAFKA_BOOTSTRAP_SERVERS -> spring.kafka.bootstrap-servers
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+
+      # Only used if the Brain talks to Postgres. Match your real config.
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-robot}
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:-robot}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-robot}
+
+      # Ollama runs on the host machine
+      AI_API_URL: http://host.docker.internal:11434/api/chat
+      AI_MODEL: qwen2.5-coder:7b-instruct
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # needed on Linux, harmless on Windows
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ================== ROBOT SERVICES (Linux host only) ==================
+
+  navigation:
+    profiles: ["robot"]
+    build: ./navigation_service
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      SERIAL_PORT: ${SERIAL_PORT:-/dev/ttyACM0}     # needs a small code change, see notes
+    devices:
+      - "${SERIAL_PORT:-/dev/ttyACM0}:${SERIAL_PORT:-/dev/ttyACM0}"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+
+  vision:
+    profiles: ["robot"]
+    build: ./vision_service
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      CAMERA_INDEX: 0
+      KNOWN_FACES_PATH: /data/known_faces.pkl        # needs a small code change, see notes
+    devices:
+      - "/dev/video0:/dev/video0"
+    volumes:
+      - vision-data:/data
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+
+  speech:
+    profiles: ["robot"]
+    build: ./speech_service
+    restart: unless-stopped
+    ports:
+      - "8003:8003"
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      AUDIO_INPUT_DEVICE: ${AUDIO_INPUT_DEVICE:-0}   # index differs inside the container
+    devices:
+      - "/dev/snd:/dev/snd"
+    group_add:
+      - audio
+    volumes:
+      - whisper-cache:/root/.cache                   # keeps the Whisper model between restarts
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+
+volumes:
+  kafka-data:
+  postgres-data:
+  redis-data:
+  vision-data:
+  whisper-cache:

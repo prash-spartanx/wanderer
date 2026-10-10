@@ -1,0 +1,610 @@
+navigation service code 
+-----------
+structure 
+---------
+FullName
+--------
+C:\Users\prashant\OneDrive\Desktop\navigation_service\.env
+C:\Users\prashant\OneDrive\Desktop\navigation_service\config.py
+C:\Users\prashant\OneDrive\Desktop\navigation_service\kafka_consumer.py
+C:\Users\prashant\OneDrive\Desktop\navigation_service\kafka_producer.py
+C:\Users\prashant\OneDrive\Desktop\navigation_service\main.py
+C:\Users\prashant\OneDrive\Desktop\navigation_service\personality.py
+C:\Users\prashant\OneDrive\Desktop\navigation_service\requirements.txt
+C:\Users\prashant\OneDrive\Desktop\navigation_service\sensor_reader.py
+C:\Users\prashant\OneDrive\Desktop\navigation_service\serial_controller.py
+C:\Users\prashant\OneDrive\Desktop\navigation_service\wander_engine.py
+-----
+wander_engine.py
+----
+import time
+import random
+import logging
+from serial_controller import SerialController
+from sensor_reader import SensorReader
+import personality 
+
+STATE_EXPLORING = "EXPLORING"
+STATE_REACTING = "REACTING"
+STATE_DECIDING = "DECIDING"
+STATE_PAUSED = "PAUSED"
+
+class WanderEngine:
+    def __init__(self, serial_ctrl: SerialController, sensor_reader: SensorReader, kafka_producer=None):
+        self.serial = serial_ctrl
+        self.sensor = sensor_reader
+        self.kafka_producer = kafka_producer
+        self.state = STATE_EXPLORING
+        self.is_active = False
+        
+        self.obstacle_threshold = 25.0 
+        self.fwd_speed = 140
+        self.turn_speed = 120
+
+    def start(self):
+        self.is_active = True
+        self.state = STATE_EXPLORING
+        self.run_loop()
+
+    def pause(self):
+        """Called by the Kafka Consumer when Brain says PAUSE_WANDER"""
+        self.state = STATE_PAUSED
+        self.serial.send_command("STOP")
+        logging.info("Wander Engine PAUSED by Brain.")
+
+    def resume(self):
+        """Called by the Kafka Consumer when Brain says RESUME_WANDER"""
+        # THE FIX: Check the sensor before blindly going back to EXPLORING
+        current_distance = self.sensor.get_distance()
+        
+        if current_distance < self.obstacle_threshold:
+            logging.info("Resuming, but obstacle still present! Forcing a turn.")
+            self.state = STATE_DECIDING # Skip EXPLORING, go straight to turning
+        else:
+            self.state = STATE_EXPLORING
+            
+        logging.info(f"Wander Engine RESUMED in state: {self.state}")
+
+    def execute_manual_turn(self, direction: str):
+        """Called when Brain explicitly sends ROTATE_LEFT or ROTATE_RIGHT"""
+        self.state = STATE_PAUSED # Pause normal loop while we force the turn
+        if direction == "LEFT":
+            self.serial.send_command(f"LEFT:{self.turn_speed}")
+        else:
+            self.serial.send_command(f"RIGHT:{self.turn_speed}")
+            
+        time.sleep(0.6) # Approximate 90-degree turn
+        self.serial.send_command("STOP")
+        self.state = STATE_EXPLORING # Safe to explore again
+
+    def run_loop(self):
+        """The core state machine loop."""
+        while self.is_active:
+            if self.state == STATE_PAUSED:
+                time.sleep(0.1)
+                continue # Skip the rest of the loop until resumed
+                
+            distance = self.sensor.get_distance()
+            is_tilted = self.sensor.get_is_tilted() 
+            
+            if is_tilted:
+                logging.critical("Robot is tilted! Stopping motors.")
+                self.serial.send_command("STOP")
+                self.is_active = False
+                break
+                
+            if self.state == STATE_EXPLORING:
+                self._handle_exploring(distance)
+                
+            elif self.state == STATE_REACTING:
+                self._handle_reacting()
+                
+            elif self.state == STATE_DECIDING:
+                self._handle_deciding()
+                
+            time.sleep(0.05) 
+
+    def _handle_exploring(self, current_distance: float):
+        if current_distance < self.obstacle_threshold:
+            self.serial.send_command("STOP")
+            
+            # Fetch the personality text
+            reaction_text = personality.get_reaction("obstacle_found")
+            
+            # TODO: Publish to Kafka here: {"event": "obstacle_found", "reaction": reaction_text}
+            if self.kafka_producer:
+                self.kafka_producer.publish_event("obstacle_found", distance_cm=current_distance, reaction=reaction_text)
+            logging.info(f"Obstacle found! Publishing: {reaction_text}")
+            
+            self.state = STATE_REACTING
+        else:
+            # Path is clear, drive forward
+            self.serial.send_command(f"FWD:{self.fwd_speed}")
+        
+    def _handle_reacting(self):
+        """Back up slightly to clear the wheels."""
+        self.serial.send_command(f"BWD:{self.fwd_speed}")
+        time.sleep(0.4)
+        self.serial.send_command("STOP")
+        self.state = STATE_DECIDING
+        
+    def _handle_deciding(self):
+        """Pick a random direction, turn, and clear the path."""
+        direction = random.choice(['LEFT', 'RIGHT'])
+        if direction == 'LEFT':
+            self.serial.send_command(f"LEFT:{self.turn_speed}")
+        else:
+            self.serial.send_command(f"RIGHT:{self.turn_speed}")
+            
+        time.sleep(0.6) # Turn duration
+        self.serial.send_command("STOP")
+        
+        # TODO: Publish path_cleared to Kafka here
+        self.state = STATE_EXPLORING
+---
+serial_controller
+---
+import serial
+import time
+import logging
+
+class SerialController:
+    def __init__(self, port: str, baudrate: int = 115200):
+        self.port = port
+        self.baudrate = baudrate
+        self.serial_conn = None
+        self.connect()
+
+    def connect(self):
+        """Attempts to open the serial port."""
+        try:
+            # We use a timeout of 0.1s so our reading functions don't hang forever 
+            # if the Arduino suddenly unplugs or loses power.
+            self.serial_conn = serial.Serial(self.port, self.baudrate, timeout=0.1)
+            
+            # Arduino usually resets when a serial connection is opened. 
+            # We sleep for 2 seconds to let the bootloader finish before sending commands.
+            time.sleep(2) 
+            logging.info(f"Successfully connected to Arduino on {self.port}")
+        except serial.SerialException as e:
+            logging.error(f"Failed to connect to Arduino: {e}")
+            self.serial_conn = None
+
+    def send_command(self, command: str) -> bool:
+        """
+        Takes a string command (e.g. 'FWD:140'), encodes it to bytes, 
+        and writes it to the serial port.
+        """
+        if not self.serial_conn or not self.serial_conn.is_open:
+            logging.warning("Cannot send command, serial port is closed.")
+            return False
+            
+        try:
+            # 1. Add the newline terminator
+            formatted_command = f"{command}\n"
+            
+            # 2. Encode string to bytes and write to the hardware buffer
+            self.serial_conn.write(formatted_command.encode('utf-8'))
+            
+            # 3. Force the buffer to flush out immediately
+            self.serial_conn.flush()
+            return True
+            
+        except Exception as e:
+            logging.error(f"Error sending command {command}: {e}")
+            return False
+        
+    def read_line(self) -> str:
+        """Reads a line of text from the serial port, if available."""
+        if not self.serial_conn or not self.serial_conn.is_open:
+            logging.warning("Cannot read line, serial port is closed.")
+            return ""
+        
+        try:
+            line = self.serial_conn.readline().decode('utf-8').strip()
+            return line
+        except Exception as e:
+            logging.error(f"Error reading line from serial: {e}")
+            return ""
+----
+sensor_reader
+---
+import threading
+import time
+import logging
+from serial_controller import SerialController
+
+class SensorState:
+    def __init__(self):
+        self.front_distance_cm = 400.0  # Default to max distance
+        self.is_tilted = False
+        self.last_updated = 0.0
+        self.lock = threading.Lock()    # The critical mutex lock
+
+class SensorReader:
+    def __init__(self, serial_ctrl: SerialController, sense_interval_ms: int = 100):
+        self.serial = serial_ctrl
+        self.interval = sense_interval_ms / 1000.0
+        self.state = SensorState()
+        self.running = False
+        self.thread = None
+
+    def start(self):
+        """Spins up the background thread."""
+        if self.thread is None or not self.thread.is_alive():
+            self.running = True
+            self.thread = threading.Thread(target=self._read_loop, daemon=True)
+            self.thread.start()
+            logging.info("Sensor reader thread started.")
+
+    def stop(self):
+        """Signals the thread to shut down."""
+        self.running = False
+        if self.thread:
+            self.thread.join()
+            logging.info("Sensor reader thread stopped.")
+
+    def get_distance(self) -> float:
+        """Thread-safe read for the Wander Engine to use."""
+        with self.state.lock:
+            return self.state.front_distance_cm
+
+    def get_is_tilted(self) -> boolean:
+        with self.state.lock:
+            return self.state.is_tilted;
+
+    def _read_loop(self):
+        """The continuous background loop."""
+        while self.running:
+            if self.serial.serial_conn and self.serial.serial_conn.is_open:
+                # 1. Ask Arduino for data
+                self.serial.send_command("PING")
+                
+                # 2. Read the response
+                line = self.serial.read_line()
+                
+                if line:
+                    self._parse_and_update(line)
+            
+            time.sleep(self.interval)
+
+    def _parse_and_update(self, line: str):
+        """Parses the line and safely updates the shared sensor state."""
+        # 1. Split the string to separate the prefix from the data (e.g., "DIST" and "25.5")
+        parts = line.split(":")
+        
+        # If there is no colon, it's not a valid data string, so we ignore it
+        if len(parts) != 2:
+            return 
+
+        prefix = parts[0]
+        data = parts[1]
+
+        try:
+            # 2. CRITICAL: Acquire the lock BEFORE modifying the shared state
+            with self.state.lock:
+                
+                # 3. Handle Ultrasonic Distance Data
+                if prefix == "DIST":
+                    self.state.front_distance_cm = float(data)
+                    self.state.last_updated = time.time()
+                    
+                # 4. Handle MPU-6050 Gyro/Accel Data
+                elif prefix == "GYRO":
+                    # The data looks like "0.1,0.02,0.98,4.5,-2.1,0.0"
+                    # We split it by the comma to get a list of the 6 numbers
+                    gyro_values = data.split(",")
+                    
+                    if len(gyro_values) == 6:
+                        # Z-axis acceleration is the 3rd value in the list (index 2)
+                        accel_z = float(gyro_values[2])
+                        
+                        # If Z-axis gravity drops below 0.5g or spikes above 1.5g, it is tilted
+                        if accel_z < 0.5 or accel_z > 1.5:
+                            self.state.is_tilted = True
+                        else:
+                            self.state.is_tilted = False
+                            
+                        self.state.last_updated = time.time()
+
+        except ValueError:
+            # This safely catches errors if the Arduino sends corrupted numbers like "DIST:abc"
+            logging.warning(f"Received non-numeric sensor data in line: '{line}'")
+----
+personality.py
+----
+import random
+import logging
+
+# This dictionary holds immediate, generic physical reactions.
+# It does NOT hold object-specific or person-specific text.
+REACTIONS = {
+    "obstacle_found": [
+        "Oh! Something's blocking me here! Let me check it out.",
+        "Hmm, I can't go this way.",
+        "There's something in my path!"
+    ],
+    "person_detected": [
+        "Oh! Someone's standing there!",
+        "Hello? Is someone there?",
+        "Wait, I found someone!"
+    ],
+    "path_cleared": [
+        "Great, the path is clear now!",
+        "All good, continuing my exploration!",
+        "Let's see what else is around here."
+    ],
+    "turning": [
+        "Let me try going this way.",
+        "Changing direction!",
+        "Hmm, what's over here?"
+    ],
+    "tilted": [
+        "Whoa! I'm falling!",
+        "Help! I'm losing my balance!",
+        "Ouch, that's not flat ground!"
+    ]
+}
+
+def get_reaction(event_type: str) -> str:
+    """
+    Fetches a random reaction string for a given event.
+    Returns a safe fallback if the event doesn't exist.
+    """
+    if event_type in REACTIONS:
+        choices = REACTIONS[event_type]
+        selected_reaction = random.choice(choices)
+        logging.debug(f"Selected reaction for '{event_type}': {selected_reaction}")
+        return selected_reaction
+    else:
+        logging.warning(f"Unknown event type requested: {event_type}")
+        return "I'm not sure what just happened!"
+---
+main.py
+---
+import logging
+import sys
+import signal
+from kafka_producer import NavKafkaProducer
+from kafka_consumer import NavKafkaConsumer
+from wander_engine import WanderEngine
+from serial_controller import SerialController
+from sensor_reader import SensorReader
+import config
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+logger = logging.getLogger(__name__)
+
+# Global references for cleanup
+serial_ctrl = None
+sensor_reader = None
+wander_engine = None
+kafka_producer = None
+kafka_consumer = None
+
+
+def signal_handler(sig, frame):
+    """Handle Ctrl+C gracefully to shut down all components."""
+    logger.info("Shutting down gracefully...")
+    
+    if wander_engine:
+        wander_engine.is_active = False
+    if sensor_reader:
+        sensor_reader.stop()
+    if kafka_consumer:
+        kafka_consumer.stop()
+    if serial_ctrl:
+        if serial_ctrl.serial_conn:
+            serial_ctrl.serial_conn.close()
+    
+    logger.info("All components shut down successfully.")
+    sys.exit(0)
+
+
+def main():
+    """Initialize and run all components of the navigation service."""
+    global serial_ctrl, sensor_reader, wander_engine, kafka_producer, kafka_consumer
+    
+    logger.info("=== Navigation Service Starting ===")
+    
+    try:
+        # 1. Initialize Serial Connection to Arduino
+        logger.info("Initializing Serial Controller...")
+        serial_ctrl = SerialController(port='/dev/ttyACM0')  # Change to COM3 on Windows if needed
+        if not serial_ctrl.serial_conn:
+            logger.error("Failed to connect to Arduino. Exiting.")
+            return
+        
+        # 2. Initialize Sensor Reader (runs in background thread)
+        logger.info("Initializing Sensor Reader...")
+        sensor_reader = SensorReader(serial_ctrl, sense_interval_ms=100)
+        sensor_reader.start()
+        
+        # 3. Initialize Kafka Producer
+        logger.info("Initializing Kafka Producer...")
+        kafka_producer = NavKafkaProducer()
+        
+        # 4. Initialize Wander Engine (core logic)
+        logger.info("Initializing Wander Engine...")
+        wander_engine = WanderEngine(serial_ctrl, sensor_reader, kafka_producer)
+        
+        # 5. Initialize Kafka Consumer (listens for brain commands)
+        logger.info("Initializing Kafka Consumer...")
+        kafka_consumer = NavKafkaConsumer(wander_engine)
+        kafka_consumer.start()
+        
+        # 6. Register signal handler for graceful shutdown
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
+        # 7. Start the main wander engine loop
+        logger.info("Starting Wander Engine main loop...")
+        wander_engine.start()
+        
+    except Exception as e:
+        logger.error(f"Fatal error during initialization: {e}", exc_info=True)
+        signal_handler(None, None)
+
+
+if __name__ == "__main__":
+    main()
+----
+kafka_producer.py
+---
+import json
+import logging
+from datetime import datetime, timezone
+from confluent_kafka import Producer
+import config
+
+class NavKafkaProducer:
+    def __init__(self):
+        # TODO 1: Create the configuration dictionary using config.KAFKA_BOOTSTRAP
+        conf = {
+            'bootstrap.servers': config.KAFKA_BOOTSTRAP
+        }
+        
+        # TODO 2: Instantiate the confluent_kafka Producer and assign it to self.producer
+        self.producer = Producer(conf)
+        self.topic = config.KAFKA_TOPIC_NAV_EVENTS
+        logging.info(f"Kafka Producer initialized. Targeting topic: {self.topic}")
+
+    def publish_event(self, event_type: str, distance_cm: float = None, reaction: str = None):
+        """
+        Builds the JSON payload and sends it to Kafka.
+        """
+        # 1. Build the dictionary payload (Look at Section 7.7 of your guide for the DTO)
+        payload = {
+            "event": event_type,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        
+        # Only add optional fields if they exist
+        if distance_cm is not None:
+            payload["distance_cm"] = distance_cm
+        if reaction is not None:
+            payload["reaction"] = reaction
+
+        # TODO 3: Convert the 'payload' dictionary into a JSON string (use json.dumps)
+        json_string = json.dumps(payload)
+        
+        # TODO 4: Use self.producer to send the JSON string (encoded to utf-8) to self.topic
+        self.producer.produce(self.topic, json_string.encode('utf-8'))
+        
+        # TODO 5: Call flush() so the message leaves the script immediately
+        self.producer.flush()
+
+        logging.debug(f"Published to {self.topic}: {payload}")
+        
+---
+kafka_consumer.py
+----
+import json
+import logging
+import threading
+from confluent_kafka import Consumer, KafkaError
+import config
+
+
+class NavKafkaConsumer:
+    def __init__(self, wander_engine):
+        """
+        Initialize the Kafka Consumer to listen for brain commands.
+        """
+        self.wander_engine = wander_engine
+        self.running = False
+        self.thread = None
+        
+        # Configure the consumer
+        conf = {
+            'bootstrap.servers': config.KAFKA_BOOTSTRAP,
+            'group.id': config.KAFKA_GROUP_ID,
+            'auto.offset.reset': 'earliest'
+        }
+        
+        self.consumer = Consumer(conf)
+        self.topic = config.KAFKA_TOPIC_BRAIN_COMMANDS
+        self.consumer.subscribe([self.topic])
+        logging.info(f"Kafka Consumer initialized. Listening to topic: {self.topic}")
+
+    def start(self):
+        """Spin up the background consumer thread."""
+        if self.thread is None or not self.thread.is_alive():
+            self.running = True
+            self.thread = threading.Thread(target=self._consume_loop, daemon=True)
+            self.thread.start()
+            logging.info("Kafka Consumer thread started.")
+
+    def stop(self):
+        """Signal the consumer thread to shut down."""
+        self.running = False
+        if self.thread:
+            self.thread.join()
+        if self.consumer:
+            self.consumer.close()
+        logging.info("Kafka Consumer thread stopped.")
+
+    def _consume_loop(self):
+        """The continuous background loop that listens for messages."""
+        while self.running:
+            msg = self.consumer.poll(timeout=1.0)
+
+            if msg is None:
+                continue
+
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue
+                else:
+                    logging.error(f"Consumer error: {msg.error()}")
+                    break
+
+            try:
+                # 1. Decode the message value from bytes to string
+                message_str = msg.value().decode('utf-8')
+                
+                # 2. Parse the JSON string into a dictionary
+                command_obj = json.loads(message_str)
+                
+                # 3. Extract the command field
+                command = command_obj.get('command')
+                
+                # 4. Route the command to the appropriate wander engine method
+                if command == "PAUSE_WANDER":
+                    self.wander_engine.pause()
+                    
+                elif command == "RESUME_WANDER":
+                    self.wander_engine.resume()
+                    
+                elif command == "ROTATE_LEFT":
+                    self.wander_engine.execute_manual_turn("LEFT")
+                    
+                elif command == "ROTATE_RIGHT":
+                    self.wander_engine.execute_manual_turn("RIGHT")
+                    
+                else:
+                    logging.warning(f"Unknown command received: {command}")
+                    
+            except json.JSONDecodeError as e:
+                logging.error(f"Failed to decode JSON message: {e}")
+            except Exception as e:
+                logging.error(f"Error processing message: {e}")
+----
+config.py
+----
+import os
+from dotenv import load_dotenv
+
+# Load variables from .env file into the environment
+load_dotenv()
+
+# Kafka Settings
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
+KAFKA_TOPIC_NAV_EVENTS = os.getenv("KAFKA_TOPIC_NAV_EVENTS", "nav-events")
+KAFKA_TOPIC_BRAIN_COMMANDS = os.getenv("KAFKA_TOPIC_BRAIN_COMMANDS", "brain-commands")
+KAFKA_GROUP_ID = os.getenv("KAFKA_GROUP_ID", "navigation-service")

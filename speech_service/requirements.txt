@@ -1,0 +1,13 @@
+confluent-kafka==2.15.1
+fastapi==0.141.1
+numpy==2.5.3; python_version >= "3.12"
+numpy==2.4.6; python_version < "3.12"
+onnxruntime==1.30.0
+openai-whisper==20250625
+openwakeword==0.6.0
+python-dotenv==1.2.3
+pyttsx3==2.99
+sounddevice==0.5.6
+tflite-runtime==2.14.0; platform_system == "Linux"
+torch==2.14.0
+uvicorn[standard]==0.52.4
